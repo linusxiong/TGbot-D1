@@ -8,6 +8,7 @@
  * [重构] 彻底重构了自动回复和关键词屏蔽的管理界面，引入了列表、新增、删除功能。
  * [新增] 完整的管理员配置菜单。
  * [新增] 备份群组功能：配置一个群组，用于接收所有用户消息的副本，不参与回复。
+ * [新增] 协管员授权功能：允许设置额外的管理员ID，他们可以绕过私聊验证并回复用户消息。
  * * 部署要求: 
  * 1. D1 数据库绑定，名称必须为 'TG_BOT_DB'。
  * 2. 环境变量 ADMIN_IDS, BOT_TOKEN, ADMIN_GROUP_ID, 等不变。
@@ -280,11 +281,44 @@ async function getConfig(key, env, defaultValue) {
     return defaultValue;
 }
 
-function isAdminUser(userId, env) {
+/**
+ * 检查用户是否是主管理员 (来自 ADMIN_IDS 环境变量)
+ */
+function isPrimaryAdmin(userId, env) {
     if (!env.ADMIN_IDS) return false;
     // 确保 ADMIN_IDS 是逗号分隔的字符串
     const adminIds = env.ADMIN_IDS.split(',').map(id => id.trim());
     return adminIds.includes(userId.toString());
+}
+
+
+/**
+ * [新增] 获取授权协管员 ID 列表
+ */
+async function getAuthorizedAdmins(env) {
+    const jsonString = await getConfig('authorized_admins', env, '[]');
+    try {
+        const adminList = JSON.parse(jsonString);
+        // 确保列表是有效的数组，并且所有元素都被修剪并转换为字符串
+        return Array.isArray(adminList) ? adminList.map(id => id.toString().trim()).filter(id => id !== "") : [];
+    } catch (e) {
+        console.error("Failed to parse authorized_admins from D1:", e);
+        return [];
+    }
+}
+
+/**
+ * 检查用户是否是任意管理员 (主管理员或授权协管员)
+ */
+async function isAdminUser(userId, env) {
+    // 1. 检查是否是主管理员 (ADMIN_IDS 环境变量)
+    if (isPrimaryAdmin(userId, env)) {
+        return true;
+    }
+
+    // 2. 检查是否是授权协管员 (D1 配置)
+    const authorizedAdmins = await getAuthorizedAdmins(env);
+    return authorizedAdmins.includes(userId.toString());
 }
 
 
@@ -401,11 +435,14 @@ async function handlePrivateMessage(message, env) {
     const trimmedText = text.trim();
     const userId = chatId;
 
-    const isAdmin = isAdminUser(userId, env);
+    // 检查是否是主管理员 (只有主管理员能访问配置菜单)
+    const isPrimary = isPrimaryAdmin(userId, env);
+    // 检查是否是任意管理员 (主管理员或授权协管员)
+    const isAdmin = await isAdminUser(userId, env);
     
     // 1. 检查 /start 或 /help 命令
     if (text === "/start" || text === "/help") {
-        if (isAdmin) {
+        if (isPrimary) { // 只有主管理员能访问配置菜单
             await handleAdminConfigStart(chatId, env);
         } else {
             await handleStart(chatId, env);
@@ -443,15 +480,15 @@ async function handlePrivateMessage(message, env) {
         return; 
     }
     
-    // 管理员在配置编辑状态中发送的文本输入
-    if (isAdmin) {
+    // 主管理员在配置编辑状态中发送的文本输入
+    if (isPrimary) {
         const adminStateJson = await dbAdminStateGet(userId, env);
         if (adminStateJson) {
             await handleAdminConfigInput(userId, text, adminStateJson, env);
             return;
         }
         
-        // --- 核心修复: 确保管理员用户跳过验证 ---
+        // --- 核心修复: 确保主管理员用户跳过验证 ---
         if (user.user_state !== "verified") {
             // 更新本地 user 对象和 D1 数据库
             user.user_state = "verified"; 
@@ -459,6 +496,13 @@ async function handlePrivateMessage(message, env) {
         }
         // --- 修复结束 ---
     }
+    
+    // --- [新增] 协管员绕过验证逻辑 ---
+    if (isAdmin && user.user_state !== "verified") {
+        user.user_state = "verified"; 
+        await dbUserUpdate(userId, { user_state: "verified" }, env); 
+    }
+    // --- [新增] 协管员绕过验证逻辑结束 ---
 
     // 2. 检查用户的验证状态
     const userState = user.user_state;
@@ -678,6 +722,13 @@ async function handleVerification(chatId, answer, env) {
 // --- 管理员配置主菜单逻辑 (使用 D1) ---
 
 async function handleAdminConfigStart(chatId, env) {
+    const isPrimary = isPrimaryAdmin(chatId, env);
+    if (!isPrimary) {
+        // 非主管理员不显示配置菜单
+        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "您是授权协管员，已绕过验证。此菜单仅供主管理员使用。", });
+        return;
+    }
+    
     const menuText = `
 ⚙️ <b>机器人主配置菜单</b>
 
@@ -693,7 +744,9 @@ async function handleAdminConfigStart(chatId, env) {
             [{ text: "🚫 关键词屏蔽管理", callback_data: "config:menu:keyword" }],
             // 第三行：过滤
             [{ text: "🔗 按类型过滤管理", callback_data: "config:menu:filter" }],
-            // [新增] 备份群组设置按钮
+            // 协管员授权设置按钮
+            [{ text: "🧑‍💻 协管员授权设置", callback_data: "config:menu:authorized" }], 
+            // 备份群组设置按钮
             [{ text: "💾 备份群组设置", callback_data: "config:menu:backup" }], 
             // 第四行：刷新
             [{ text: "🔄 刷新主菜单", callback_data: "config:menu" }],
@@ -748,6 +801,52 @@ async function handleAdminBaseConfigMenu(chatId, messageId, env) {
             [{ text: "📝 编辑欢迎消息", callback_data: "config:edit:welcome_msg" }],
             [{ text: "❓ 编辑验证问题", callback_data: "config:edit:verif_q" }],
             [{ text: "🔑 编辑验证答案", callback_data: "config:edit:verif_a" }],
+            [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
+        ]
+    };
+
+    const apiMethod = (messageId && messageId !== 0) ? "editMessageText" : "sendMessage";
+    const params = {
+        chat_id: chatId,
+        text: menuText,
+        parse_mode: "HTML",
+        reply_markup: menuKeyboard,
+    };
+    if (apiMethod === "editMessageText") {
+        params.message_id = messageId;
+    }
+    await telegramApi(env.BOT_TOKEN, apiMethod, params);
+}
+
+/**
+ * [新增] 协管员授权设置子菜单
+ */
+async function handleAdminAuthorizedConfigMenu(chatId, messageId, env) {
+    const primaryAdmins = env.ADMIN_IDS ? env.ADMIN_IDS.split(',').map(id => id.trim()).filter(id => id !== "") : [];
+    const authorizedAdmins = await getAuthorizedAdmins(env);
+    
+    const allAdmins = [...new Set([...primaryAdmins, ...authorizedAdmins])]; // 合并并去重
+    const authorizedCount = authorizedAdmins.length;
+
+    const menuText = `
+🧑‍💻 <b>协管员授权设置</b>
+
+<b>主管理员 (来自 ENV):</b> <code>${primaryAdmins.join(', ')}</code>
+<b>已授权协管员 (来自 D1):</b> <code>${authorizedAdmins.join(', ') || '无'}</code>
+<b>总管理员/协管员数量:</b> ${allAdmins.length} 人
+
+<b>注意：</b>
+1. 协管员 ID 或用户名必须与群组话题中的回复者一致。
+2. 协管员的私聊会自动绕过验证。
+3. 输入格式：ID 或用户名，多个用逗号分隔。
+
+请选择要修改的配置项:
+    `.trim();
+
+    const menuKeyboard = {
+        inline_keyboard: [
+            [{ text: "✏️ 设置/修改协管员列表", callback_data: "config:edit:authorized_admins" }],
+            [{ text: `🗑️ 清空协管员列表 (${authorizedCount}人)`, callback_data: "config:edit:authorized_admins_clear" }],
             [{ text: "⬅️ 返回主菜单", callback_data: "config:menu" }],
         ]
     };
@@ -1086,6 +1185,12 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 仅移除首尾空格
         } else if (adminState.key === 'backup_group_id') {
             finalValue = text.trim();
+        // [新增] 协管员授权列表处理
+        } else if (adminState.key === 'authorized_admins') {
+            // 将输入字符串按逗号分隔，并去除空格和空项，最终存储为 JSON 数组
+            const adminList = text.split(',').map(id => id.trim()).filter(id => id !== "");
+            finalValue = JSON.stringify(adminList); // 存储 JSON 字符串
+            
         }
 
         // --- 新增规则逻辑 ---
@@ -1149,6 +1254,16 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
                     successMsg = `✅ <b>备份群组 ID</b>已更新为：<code>${escapeHtml(finalValue)}</code>`; 
                 }
                 break;
+            // [新增] 协管员授权列表成功消息
+            case 'authorized_admins': {
+                const authorizedAdmins = JSON.parse(finalValue);
+                if (authorizedAdmins.length === 0) {
+                     successMsg = `✅ <b>协管员授权列表</b>已清空。`;
+                } else {
+                     successMsg = `✅ <b>协管员授权列表</b>已更新，共授权 ${authorizedAdmins.length} 人。`;
+                }
+                break;
+            }
             default: successMsg = "✅ 配置已更新。"; break;
         }
 
@@ -1168,6 +1283,9 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 菜单跳转
         } else if (adminState.key === 'backup_group_id') {
             nextMenuAction = 'config:menu:backup';
+        // [新增] 协管员授权列表菜单跳转
+        } else if (adminState.key === 'authorized_admins') {
+            nextMenuAction = 'config:menu:authorized';
         }
         
         // 发送一个新的菜单消息，实现自动跳转。
@@ -1180,6 +1298,9 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         // 备份群组 ID 菜单跳转
         } else if (nextMenuAction === 'config:menu:backup') {
              await handleAdminBackupConfigMenu(userId, 0, env); 
+        // [新增] 协管员授权列表菜单跳转
+        } else if (nextMenuAction === 'config:menu:authorized') {
+             await handleAdminAuthorizedConfigMenu(userId, 0, env); 
         } else {
              await handleAdminConfigStart(userId, env); // 返回主菜单
         }
@@ -1188,6 +1309,7 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
     } else {
         // 删除状态
         await dbAdminStateDelete(userId, env);
+        // 此处错误提示已修复，不会出现 D1_ERROR:no such table:admin_state:SQLITE_ERROR
         await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "⚠️ 状态错误，已重置。请重新使用 /start 访问菜单。", });
     }
 }
@@ -1617,11 +1739,12 @@ async function handlePinCard(callbackQuery, message, env) {
 async function handleCallbackQuery(callbackQuery, env) {
     const { data, message, from: user } = callbackQuery;
     const chatId = message.chat.id.toString();
+    const isPrimary = isPrimaryAdmin(user.id, env); // 只有主管理员才能修改配置
 
     // 检查是否是管理员配置回调
     if (data.startsWith('config:')) {
-        if (!isAdminUser(user.id, env)) {
-            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "您没有权限执行此操作。", show_alert: true });
+        if (!isPrimary) {
+            await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "您不是主管理员，没有权限执行此操作。", show_alert: true });
             return;
         }
         
@@ -1646,6 +1769,9 @@ async function handleCallbackQuery(callbackQuery, env) {
             // 备份群组菜单导航
             } else if (keyOrAction === 'backup') {
                 await handleAdminBackupConfigMenu(chatId, message.message_id, env);
+            // [新增] 协管员授权菜单导航
+            } else if (keyOrAction === 'authorized') {
+                await handleAdminAuthorizedConfigMenu(chatId, message.message_id, env);
             } else { // config:menu (主菜单)
                 // 刷新主菜单，尝试编辑原消息
                 await handleAdminConfigStart(chatId, env);
@@ -1654,7 +1780,7 @@ async function handleCallbackQuery(callbackQuery, env) {
         } else if (actionType === 'toggle' && keyOrAction && value) {
             await dbConfigPut(keyOrAction, value, env);
             await handleAdminTypeBlockMenu(chatId, message.message_id, env); // 刷新过滤菜单
-        // --- 进入编辑模式处理 (用于文本输入: 基础配置/阈值/备份群组 ID) ---
+        // --- 进入编辑模式处理 (用于文本输入: 基础配置/阈值/备份群组 ID/协管员列表) ---
         } else if (actionType === 'edit' && keyOrAction) {
             
             // 清除备份群组 ID 的特殊处理
@@ -1662,6 +1788,14 @@ async function handleCallbackQuery(callbackQuery, env) {
                 await dbConfigPut('backup_group_id', '', env); // 设置为空字符串
                 await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: `✅ 备份群组 ID 已清除，备份功能已禁用。`, show_alert: false });
                 await handleAdminBackupConfigMenu(chatId, message.message_id, env); // 刷新菜单
+                return;
+            }
+            
+            // [新增] 清除协管员授权列表的特殊处理
+             if (keyOrAction === 'authorized_admins_clear') {
+                await dbConfigPut('authorized_admins', '[]', env); // 设置为空 JSON 数组
+                await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: callbackQuery.id, text: `✅ 协管员授权列表已清空。`, show_alert: false });
+                await handleAdminAuthorizedConfigMenu(chatId, message.message_id, env); // 刷新菜单
                 return;
             }
             
@@ -1676,6 +1810,8 @@ async function handleCallbackQuery(callbackQuery, env) {
                 case 'block_threshold': prompt = "请发送**屏蔽次数阈值** (纯数字)："; break;
                 // 备份群组 ID 输入
                 case 'backup_group_id': prompt = "请发送**新的备份群组 ID 或用户名**："; break; 
+                // [新增] 协管员授权列表输入
+                case 'authorized_admins': prompt = "请发送**新的协管员 ID 或用户名列表**，多个请用逗号分隔 (例如：12345678, @username, 98765432)："; break;
                 default: return;
             }
             
@@ -1836,6 +1972,17 @@ async function handleAdminReply(message, env) {
 
     // 忽略机器人自己的消息
     if (message.from && message.from.is_bot) return;
+
+    // [新增] 检查消息发送者是否是授权协管员或主管理员
+    const senderId = message.from.id.toString();
+    const isAuthorizedAdmin = await isAdminUser(senderId, env);
+    
+    // 如果不是任何一种管理员，则不允许回复中继
+    if (!isAuthorizedAdmin) {
+        // 为了避免群内干扰，不发送失败提示，直接静默退出。
+        return; 
+    }
+
 
     const topicId = message.message_thread_id.toString();
     // 从 D1 根据 topic_id 查找 user_id
