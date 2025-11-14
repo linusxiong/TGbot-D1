@@ -398,6 +398,7 @@ async function handleUpdate(update, env) {
 async function handlePrivateMessage(message, env) {
     const chatId = message.chat.id.toString();
     const text = message.text || "";
+    const trimmedText = text.trim();
     const userId = chatId;
 
     const isAdmin = isAdminUser(userId, env);
@@ -415,6 +416,28 @@ async function handlePrivateMessage(message, env) {
     // 从 D1 获取用户数据
     const user = await dbUserGetOrCreate(userId, env);
     const isBlocked = user.is_blocked;
+
+    // 管理员清理旧对话命令
+    if (isAdmin && trimmedText.startsWith("/clean")) {
+        const cleanMatch = trimmedText.match(/^\/clean(?:\s+(\d+))?$/i);
+        if (!cleanMatch || !cleanMatch[1]) {
+            await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                chat_id: chatId,
+                text: "用法: /clean <天数>\n示例: /clean 30",
+            });
+        } else {
+            const days = parseInt(cleanMatch[1], 10);
+            if (Number.isNaN(days) || days <= 0) {
+                await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                    chat_id: chatId,
+                    text: "天数必须是正整数，例如 /clean 30",
+                });
+            } else {
+                await handleCleanCommand(chatId, days, env);
+            }
+        }
+        return;
+    }
 
     if (isBlocked) {
         return; 
@@ -1167,6 +1190,107 @@ async function handleAdminConfigInput(userId, text, adminStateJson, env) {
         await dbAdminStateDelete(userId, env);
         await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "⚠️ 状态错误，已重置。请重新使用 /start 访问菜单。", });
     }
+}
+
+
+async function handleCleanCommand(chatId, days, env) {
+    const secondsPerDay = 86400;
+    const cutoffTimestamp = Math.floor(Date.now() / 1000) - days * secondsPerDay;
+
+    let userRows = [];
+    try {
+        const queryResult = await env.TG_BOT_DB.prepare(
+            "SELECT user_id, topic_id, user_info_json FROM users WHERE topic_id IS NOT NULL"
+        ).all();
+        userRows = (queryResult && queryResult.results) ? queryResult.results : [];
+    } catch (e) {
+        console.error("清理命令查询失败:", e?.message || e);
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: "❌ 无法读取对话列表，请稍后重试。",
+        });
+        return;
+    }
+
+    const outdatedUsers = [];
+    for (const row of userRows) {
+        if (!row.user_info_json) continue;
+        try {
+            const info = JSON.parse(row.user_info_json);
+            const startedAt = info.first_message_timestamp;
+            if (typeof startedAt === "number" && startedAt > 0 && startedAt <= cutoffTimestamp) {
+                outdatedUsers.push({
+                    userId: row.user_id,
+                    topicId: row.topic_id,
+                });
+            }
+        } catch (e) {
+            console.error("解析用户 user_info_json 失败:", e?.message || e);
+            continue;
+        }
+    }
+
+    if (outdatedUsers.length === 0) {
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: `✅ 没有找到 ${days} 天以前创建的对话。`,
+        });
+        return;
+    }
+
+    let cleanedCount = 0;
+    let failedCount = 0;
+
+    for (const entry of outdatedUsers) {
+        const { userId, topicId } = entry;
+        let canDeleteDb = true;
+
+        if (topicId) {
+            try {
+                await telegramApi(env.BOT_TOKEN, "deleteForumTopic", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_thread_id: topicId,
+                });
+            } catch (err) {
+                const errMsg = err?.message || "";
+                // 如果话题已不存在，视为成功
+                if (errMsg.includes("message thread not found") || errMsg.includes("CHAT_NOT_FOUND")) {
+                    console.warn(`话题 ${topicId} 已不存在，跳过删除。`);
+                } else {
+                    canDeleteDb = false;
+                    failedCount += 1;
+                    console.error(`删除话题 ${topicId} 失败:`, errMsg || err);
+                }
+            }
+        }
+
+        if (!canDeleteDb) {
+            continue;
+        }
+
+        try {
+            await env.TG_BOT_DB.prepare("DELETE FROM messages WHERE user_id = ?").bind(userId).run();
+            await env.TG_BOT_DB.prepare("DELETE FROM users WHERE user_id = ?").bind(userId).run();
+            cleanedCount += 1;
+        } catch (dbErr) {
+            failedCount += 1;
+            console.error(`删除用户 ${userId} 数据失败:`, dbErr?.message || dbErr);
+        }
+    }
+
+    const summaryLines = [
+        `🧹 清理指令: ${days} 天以前`,
+        `符合条件会话: ${outdatedUsers.length}`,
+        `成功清除: ${cleanedCount}`,
+    ];
+    if (failedCount > 0) {
+        summaryLines.push(`失败: ${failedCount} (详见日志)`);
+    }
+
+    await telegramApi(env.BOT_TOKEN, "sendMessage", {
+        chat_id: chatId,
+        text: summaryLines.join("\n"),
+    });
 }
 
 
